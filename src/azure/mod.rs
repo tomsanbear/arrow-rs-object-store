@@ -356,8 +356,8 @@ mod tests {
         copy_if_not_exists(&integration).await;
         stream_get(&integration).await;
         put_opts(&integration, true).await;
-        delete_opts(&integration, true).await;
-        delete_opts_race_condition(&integration, true).await;
+        delete_opts(&integration).await;
+        delete_opts_race_condition(&integration).await;
         multipart(&integration, &integration).await;
         multipart_put_part_out_of_order(&integration, &integration).await;
         multipart_race_condition(&integration, false).await;

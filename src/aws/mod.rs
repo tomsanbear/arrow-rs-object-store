@@ -262,8 +262,12 @@ impl ObjectStore for AmazonS3 {
     async fn delete_opts(&self, location: &Path, opts: DeleteOptions) -> Result<()> {
         let mut request = self.client.request(Method::DELETE, location);
 
-        if let Some(if_match) = &opts.if_match {
-            request = request.header(&IF_MATCH, if_match);
+        if let Some(condition) = &opts.condition {
+            let etag = condition.e_tag.as_deref().ok_or_else(|| Error::Generic {
+                store: STORE,
+                source: "ETag required for conditional delete".to_string().into(),
+            })?;
+            request = request.header(&IF_MATCH, etag);
         }
 
         request.with_extensions(opts.extensions).send().await?;
@@ -671,8 +675,8 @@ mod tests {
         }
         if test_conditional_put {
             put_opts(&integration, true).await;
-            delete_opts(&integration, true).await;
-            delete_opts_race_condition(&integration, true).await;
+            delete_opts(&integration).await;
+            delete_opts_race_condition(&integration).await;
         }
 
         // run integration test with unsigned payload enabled

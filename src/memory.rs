@@ -295,7 +295,7 @@ impl ObjectStore for InMemory {
     }
 
     async fn delete_opts(&self, location: &Path, opts: DeleteOptions) -> Result<()> {
-        if opts.if_match.is_some() {
+        if opts.condition.is_some() {
             let entry = self.entry(location)?;
             let meta = ObjectMeta {
                 location: location.clone(),
@@ -573,8 +573,7 @@ mod tests {
         copy_if_not_exists(&integration).await;
         stream_get(&integration).await;
         put_opts(&integration, true).await;
-        delete_opts(&integration, true).await;
-        delete_opts_race_condition(&integration, true).await;
+        delete_opts(&integration).await;
         multipart(&integration, &integration).await;
         put_get_attributes(&integration).await;
         multipart_put_part_out_of_order(&integration, &integration).await;

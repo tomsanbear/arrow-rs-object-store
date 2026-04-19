@@ -28,8 +28,9 @@ use futures_util::stream::BoxStream;
 
 use crate::path::Path;
 use crate::{
-    CopyOptions, DeleteOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutResult, RenameOptions,
+    CopyOptions, DeleteOptions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutResult,
+    RenameOptions,
 };
 use crate::{PutPayload, Result};
 

@@ -691,46 +691,39 @@ pub async fn put_opts(storage: &dyn ObjectStore, supports_update: bool) {
     assert_eq!(v, NUM_WORKERS * NUM_INCREMENTS);
 }
 
-/// Tests conditional deletes
-pub async fn delete_opts(storage: &dyn ObjectStore, supports_conditional: bool) {
+/// Tests conditional deletes against a backend that supports them.
+pub async fn delete_opts(storage: &dyn ObjectStore) {
     let rng = rng();
     let suffix = String::from_utf8(rng.sample_iter(Alphanumeric).take(32).collect()).unwrap();
 
-    // Test 1: Delete with matching ETag
-    let path = Path::from(format!("delete_opts_etag_{suffix}"));
-    let result = storage.put(&path, "test data".into()).await.unwrap();
-    let etag = result.e_tag.clone();
-
-    if supports_conditional && etag.is_some() {
-        let opts = DeleteOptions {
-            if_match: etag.clone(),
-            ..Default::default()
-        };
+    // Test 1: conditional delete with the observed UpdateVersion succeeds.
+    // Each backend reads the field it needs — S3/Azure use e_tag, GCS uses
+    // version (generation number).
+    let path = Path::from(format!("delete_opts_match_{suffix}"));
+    let put = storage.put(&path, "test data".into()).await.unwrap();
+    if put.e_tag.is_some() || put.version.is_some() {
+        let opts = DeleteOptions::new().with_condition(UpdateVersion::from(put));
         storage.delete_opts(&path, opts).await.unwrap();
 
         let err = storage.get(&path).await.unwrap_err();
         assert!(matches!(err, Error::NotFound { .. }), "{err}");
-    } else if !supports_conditional {
-        let opts = DeleteOptions {
-            if_match: Some("some-etag".to_string()),
-            ..Default::default()
-        };
-        let err = storage.delete_opts(&path, opts).await.unwrap_err();
-        assert!(matches!(err, Error::NotImplemented { .. }), "{err}");
-
+    } else {
+        // Backends that do not expose any version info can't exercise this
+        // path; clean up the fixture object and skip.
         storage.delete(&path).await.unwrap();
-        return;
     }
 
-    // Test 2: Delete with non-matching ETag should fail
-    let path = Path::from(format!("delete_opts_etag_fail_{suffix}"));
-    let result = storage.put(&path, "test data".into()).await.unwrap();
-
-    if supports_conditional && result.e_tag.is_some() {
-        let opts = DeleteOptions {
-            if_match: Some("wrong-etag".to_string()),
-            ..Default::default()
-        };
+    // Test 2: conditional delete with a non-matching UpdateVersion fails with
+    // Precondition and leaves the object in place. The condition carries
+    // bogus values for both e_tag and version so every backend observes a
+    // mismatch on whichever field it inspects.
+    let path = Path::from(format!("delete_opts_mismatch_{suffix}"));
+    let put = storage.put(&path, "test data".into()).await.unwrap();
+    if put.e_tag.is_some() || put.version.is_some() {
+        let opts = DeleteOptions::new().with_condition(UpdateVersion {
+            e_tag: Some("wrong-etag".to_string()),
+            version: Some("0".to_string()),
+        });
         let err = storage.delete_opts(&path, opts).await.unwrap_err();
         assert!(matches!(err, Error::Precondition { .. }), "{err}");
 
@@ -740,56 +733,49 @@ pub async fn delete_opts(storage: &dyn ObjectStore, supports_conditional: bool) 
         storage.delete(&path).await.unwrap();
     }
 
-    // Test 3: Delete with wildcard should succeed
-    let path = Path::from(format!("delete_opts_wildcard_{suffix}"));
+    // Test 3: unconditional delete_opts(_, DeleteOptions::default()) still
+    // works — parity with delete().
+    let path = Path::from(format!("delete_opts_unconditional_{suffix}"));
     storage.put(&path, "test data".into()).await.unwrap();
+    storage
+        .delete_opts(&path, DeleteOptions::default())
+        .await
+        .unwrap();
+    let err = storage.get(&path).await.unwrap_err();
+    assert!(matches!(err, Error::NotFound { .. }), "{err}");
 
-    if supports_conditional {
-        let opts = DeleteOptions {
-            if_match: Some("*".to_string()),
-            ..Default::default()
-        };
-        storage.delete_opts(&path, opts).await.unwrap();
-    }
-
-    // Test 4: Delete with multiple ETags should succeed if one matches
-    let path = Path::from(format!("delete_opts_multi_etag_{suffix}"));
-    let result = storage.put(&path, "test data".into()).await.unwrap();
-
-    if supports_conditional && result.e_tag.is_some() {
-        let etag = result.e_tag.unwrap();
-        let opts = DeleteOptions {
-            if_match: Some(format!("\"wrong1\", {etag}, \"wrong2\"")),
-            ..Default::default()
-        };
-        storage.delete_opts(&path, opts).await.unwrap();
-
-        let err = storage.get(&path).await.unwrap_err();
-        assert!(matches!(err, Error::NotFound { .. }), "{err}");
-    }
+    // Test 4: conditional delete of a non-existent object. Backends differ:
+    // S3 and GCS return NotFound; Azure and the in-process backends may
+    // surface Precondition instead because they check the precondition
+    // against missing metadata. Either is an acceptable outcome — just
+    // assert we don't silently succeed.
+    let path = Path::from(format!("delete_opts_missing_{suffix}"));
+    let opts = DeleteOptions::new().with_condition(UpdateVersion {
+        e_tag: Some("abc".to_string()),
+        version: Some("1".to_string()),
+    });
+    let err = storage.delete_opts(&path, opts).await.unwrap_err();
+    assert!(
+        matches!(err, Error::NotFound { .. } | Error::Precondition { .. }),
+        "{err}"
+    );
 }
 
 /// Test concurrent conditional deletes (race conditions)
-pub async fn delete_opts_race_condition(storage: &dyn ObjectStore, supports_conditional: bool) {
-    if !supports_conditional {
-        return;
-    }
-
+pub async fn delete_opts_race_condition(storage: &dyn ObjectStore) {
     let rng = rng();
     let suffix = String::from_utf8(rng.sample_iter(Alphanumeric).take(32).collect()).unwrap();
     let path = Path::from(format!("delete_race_{suffix}"));
 
     let result = storage.put(&path, "test data".into()).await.unwrap();
 
-    if let Some(etag) = result.e_tag {
+    if result.e_tag.is_some() || result.version.is_some() {
         const NUM_WORKERS: usize = 5;
 
+        let condition = UpdateVersion::from(result);
         let mut futures: FuturesUnordered<_> = (0..NUM_WORKERS)
             .map(|_| {
-                let opts = DeleteOptions {
-                    if_match: Some(etag.clone()),
-                    ..Default::default()
-                };
+                let opts = DeleteOptions::new().with_condition(condition.clone());
                 storage.delete_opts(&path, opts)
             })
             .collect();

@@ -342,8 +342,8 @@ mod test {
             // Fake GCS server doesn't currently honor preconditions
             get_opts(&integration).await;
             put_opts(&integration, true).await;
-            delete_opts(&integration, true).await;
-            delete_opts_race_condition(&integration, true).await;
+            delete_opts(&integration).await;
+            delete_opts_race_condition(&integration).await;
             // Fake GCS server doesn't currently support attributes
             put_get_attributes(&integration).await;
         }

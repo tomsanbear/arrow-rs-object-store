@@ -517,35 +517,6 @@
 //! [Apache Iceberg]: https://iceberg.apache.org/
 //! [Delta Lake]: https://delta.io/
 //!
-//! # Conditional Delete
-//!
-//! Deletes can be guarded with [`DeleteOptions::if_match`] to ensure the object hasn't changed
-//! since it was last observed.
-//!
-//! ```
-//! # use object_store::{DeleteOptions, Error, ObjectStore, ObjectStoreExt};
-//! # use std::sync::Arc;
-//! # use object_store::memory::InMemory;
-//! # use object_store::path::Path;
-//! # fn get_object_store() -> Arc<dyn ObjectStore> {
-//! #   Arc::new(InMemory::new())
-//! # }
-//! # async fn conditional_delete() {
-//! let store = get_object_store();
-//! let path = Path::from("test");
-//!
-//! // Fetch version information for the object
-//! let meta = store.head(&path).await.unwrap();
-//! let opts = DeleteOptions::new().with_if_match(meta.e_tag);
-//!
-//! match store.delete_opts(&path, opts).await {
-//!     Ok(_) => {} // Successfully deleted
-//!     Err(Error::Precondition { .. }) => {} // Object has changed, retry
-//!     Err(e) => panic!("{e}"),
-//! }
-//! # }
-//! ```
-//!
 //! # TLS Certificates
 //!
 //! Stores that use HTTPS/TLS (this is true for most cloud stores) can choose the source of their [CA]
@@ -935,9 +906,9 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// The default implementation supports only unconditional deletes and will
     /// return [`Error::NotImplemented`] if conditional options are provided.
     async fn delete_opts(&self, location: &Path, opts: DeleteOptions) -> Result<()> {
-        if opts.if_match.is_some() {
+        if opts.condition.is_some() {
             return Err(Error::NotImplemented {
-                operation: "`delete_opts` with `if_match`".into(),
+                operation: "`delete_opts` with `condition`".into(),
                 implementer: self.to_string(),
             });
         }
@@ -1928,19 +1899,8 @@ pub struct PutResult {
 /// Options for a delete request
 #[derive(Debug, Clone, Default)]
 pub struct DeleteOptions {
-    /// Delete will succeed if the `ObjectMeta::e_tag` matches
-    /// otherwise returning [`Error::Precondition`]
-    ///
-    /// See <https://datatracker.ietf.org/doc/html/rfc9110#name-if-match>
-    ///
-    /// Examples:
-    ///
-    /// ```text
-    /// If-Match: "xyzzy"
-    /// If-Match: "xyzzy", "r2d2xxxx", "c3piozzzz"
-    /// If-Match: *
-    /// ```
-    pub if_match: Option<String>,
+    /// Precondition on this delete; see [`UpdateVersion`].
+    pub condition: Option<UpdateVersion>,
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
@@ -1952,18 +1912,32 @@ pub struct DeleteOptions {
 
 impl DeleteOptions {
     /// Returns an error if the preconditions on this request are not satisfied
+    /// against the supplied object metadata.
     pub fn check_preconditions(&self, meta: &ObjectMeta) -> Result<()> {
-        // The use of the invalid etag "*" means no ETag is equivalent to never matching
-        let etag = meta.e_tag.as_deref().unwrap_or("*");
+        let Some(condition) = &self.condition else {
+            return Ok(());
+        };
 
-        if let Some(m) = &self.if_match {
-            if m != "*" && m.split(',').map(str::trim).all(|x| x != etag) {
+        if let Some(required_etag) = &condition.e_tag {
+            let current = meta.e_tag.as_deref().unwrap_or("<none>");
+            if current != required_etag.as_str() {
                 return Err(Error::Precondition {
                     path: meta.location.to_string(),
-                    source: format!("{etag} does not match {m}").into(),
+                    source: format!("{current} does not match {required_etag}").into(),
                 });
             }
         }
+
+        if let Some(required_version) = &condition.version {
+            let current = meta.version.as_deref().unwrap_or("<none>");
+            if current != required_version.as_str() {
+                return Err(Error::Precondition {
+                    path: meta.location.to_string(),
+                    source: format!("{current} does not match {required_version}").into(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -1972,12 +1946,12 @@ impl DeleteOptions {
         Self::default()
     }
 
-    /// Sets the `if_match` condition.
+    /// Sets the [`UpdateVersion`] precondition.
     ///
-    /// See [`DeleteOptions::if_match`]
+    /// See [`DeleteOptions::condition`].
     #[must_use]
-    pub fn with_if_match(mut self, etag: Option<impl Into<String>>) -> Self {
-        self.if_match = etag.map(Into::into);
+    pub fn with_condition(mut self, condition: UpdateVersion) -> Self {
+        self.condition = Some(condition);
         self
     }
 
@@ -1991,17 +1965,26 @@ impl DeleteOptions {
     }
 }
 
+impl From<UpdateVersion> for DeleteOptions {
+    fn from(condition: UpdateVersion) -> Self {
+        Self {
+            condition: Some(condition),
+            extensions: Default::default(),
+        }
+    }
+}
+
 impl PartialEq<Self> for DeleteOptions {
     fn eq(&self, other: &Self) -> bool {
         let Self {
-            if_match,
+            condition,
             extensions: _,
         } = self;
         let Self {
-            if_match: other_if_match,
+            condition: other_condition,
             extensions: _,
         } = other;
-        if_match == other_if_match
+        condition == other_condition
     }
 }
 
@@ -2560,15 +2543,89 @@ mod tests {
         let extensions = Extensions::new();
 
         let options = DeleteOptions::new();
-        assert_eq!(options.if_match, None);
+        assert_eq!(options.condition, None);
         assert!(options.extensions.get::<&str>().is_none());
 
+        let condition = UpdateVersion {
+            e_tag: Some("etag-match".to_string()),
+            version: None,
+        };
         let options = options
-            .with_if_match(Some("etag-match"))
+            .with_condition(condition.clone())
             .with_extensions(extensions.clone());
 
-        assert_eq!(options.if_match, Some("etag-match".to_string()));
+        assert_eq!(options.condition, Some(condition.clone()));
         assert_eq!(options.extensions.get::<&str>(), extensions.get::<&str>());
+
+        // From<UpdateVersion> for DeleteOptions is equivalent to the builder.
+        let from = DeleteOptions::from(condition.clone());
+        assert_eq!(from.condition, Some(condition));
+    }
+
+    #[test]
+    fn test_delete_options_check_preconditions() {
+        let meta = ObjectMeta {
+            location: Path::from("test"),
+            last_modified: Utc.timestamp_nanos(100),
+            size: 100,
+            e_tag: Some("abc".to_string()),
+            version: Some("42".to_string()),
+        };
+
+        // No condition → Ok.
+        DeleteOptions::new().check_preconditions(&meta).unwrap();
+
+        // Matching ETag → Ok.
+        DeleteOptions::new()
+            .with_condition(UpdateVersion {
+                e_tag: Some("abc".to_string()),
+                version: None,
+            })
+            .check_preconditions(&meta)
+            .unwrap();
+
+        // Mismatched ETag → Precondition.
+        let err = DeleteOptions::new()
+            .with_condition(UpdateVersion {
+                e_tag: Some("wrong".to_string()),
+                version: None,
+            })
+            .check_preconditions(&meta)
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }), "{err}");
+
+        // Matching version → Ok.
+        DeleteOptions::new()
+            .with_condition(UpdateVersion {
+                e_tag: None,
+                version: Some("42".to_string()),
+            })
+            .check_preconditions(&meta)
+            .unwrap();
+
+        // Mismatched version → Precondition.
+        let err = DeleteOptions::new()
+            .with_condition(UpdateVersion {
+                e_tag: None,
+                version: Some("0".to_string()),
+            })
+            .check_preconditions(&meta)
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }), "{err}");
+
+        // Condition field set but metadata field missing → Precondition.
+        let missing_etag_meta = ObjectMeta {
+            e_tag: None,
+            ..meta.clone()
+        };
+        let err = DeleteOptions::new()
+            .with_condition(UpdateVersion {
+                e_tag: Some("abc".to_string()),
+                version: None,
+            })
+            .check_preconditions(&missing_etag_meta)
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }), "{err}");
     }
 
     fn takes_generic_object_store<T: ObjectStore>(store: T) {

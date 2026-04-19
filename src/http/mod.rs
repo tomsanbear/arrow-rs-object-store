@@ -45,9 +45,9 @@ use crate::client::{HttpConnector, http_connector};
 use crate::http::client::Client;
 use crate::path::Path;
 use crate::{
-    ClientConfigKey, ClientOptions, CopyMode, CopyOptions, GetOptions, GetResult,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result, RetryConfig,
+    ClientConfigKey, ClientOptions, CopyMode, CopyOptions, GetOptions, GetResult, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result, RetryConfig,
 };
 
 mod client;

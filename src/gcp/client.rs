@@ -566,8 +566,10 @@ impl GoogleCloudStorageClient {
             .with_extensions(opts.extensions)
             .idempotent(true);
 
-        if let Some(if_match) = &opts.if_match {
-            builder = builder.header(&HeaderName::from_static("if-match"), if_match);
+        if let Some(condition) = &opts.condition {
+            if let Some(etag) = condition.e_tag.as_deref() {
+                builder = builder.header(&HeaderName::from_static("if-match"), etag);
+            }
         }
 
         builder.send().await?;

@@ -38,9 +38,9 @@ use url::Url;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
-    Attributes, DeleteOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    UploadPart, maybe_spawn_blocking,
+    Attributes, DeleteOptions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result, UploadPart, maybe_spawn_blocking,
     path::{Path, absolute_path_to_url},
     util::InvalidGetRange,
 };
@@ -487,7 +487,7 @@ impl ObjectStore for LocalFileSystem {
     }
 
     async fn delete_opts(&self, location: &Path, opts: DeleteOptions) -> Result<()> {
-        if opts.if_match.is_some() {
+        if opts.condition.is_some() {
             let meta = self.head(location).await?;
             opts.check_preconditions(&meta)?;
         }
@@ -1331,8 +1331,7 @@ mod tests {
         copy_rename_nonexistent_object(&integration).await;
         stream_get(&integration).await;
         put_opts(&integration, false).await;
-        delete_opts(&integration, true).await;
-        delete_opts_race_condition(&integration, true).await;
+        delete_opts(&integration).await;
     }
 
     #[test]

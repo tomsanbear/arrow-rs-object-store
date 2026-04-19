@@ -589,7 +589,8 @@ impl AzureClient {
             .header(CONTENT_LENGTH, HeaderValue::from_static("0"))
             .extensions(opts.extensions);
 
-        if let Some(etag) = &opts.if_match {
+        if let Some(condition) = &opts.condition {
+            let etag = condition.e_tag.as_deref().ok_or(Error::MissingETag)?;
             builder = builder.header(&IF_MATCH, etag);
         }
 
