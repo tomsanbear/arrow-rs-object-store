@@ -567,9 +567,8 @@ impl GoogleCloudStorageClient {
             .idempotent(true);
 
         if let Some(condition) = &opts.condition {
-            if let Some(etag) = condition.e_tag.as_deref() {
-                builder = builder.header(&HeaderName::from_static("if-match"), etag);
-            }
+            let version = condition.version.as_deref().ok_or(Error::MissingVersion)?;
+            builder = builder.header(&VERSION_MATCH, version);
         }
 
         builder.send().await?;
