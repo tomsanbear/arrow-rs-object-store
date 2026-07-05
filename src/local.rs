@@ -76,6 +76,12 @@ pub(crate) enum Error {
     #[error("Unable to open file {}: {}", path.display(), source)]
     UnableToOpenFile { source: io::Error, path: PathBuf },
 
+    #[error("Unable to acquire an exclusive lock on directory {}: {}", path.display(), source)]
+    UnableToLockDir { source: io::Error, path: PathBuf },
+
+    #[error("Precondition failed for {}: {}", path, reason)]
+    Precondition { path: String, reason: String },
+
     #[error("Unable to read data from file {}: {}", path.display(), source)]
     UnableToReadBytes { source: io::Error, path: PathBuf },
 
@@ -128,6 +134,10 @@ impl From<Error> for super::Error {
             Error::AlreadyExists { path, source } => Self::AlreadyExists {
                 path,
                 source: source.into(),
+            },
+            Error::Precondition { path, reason } => Self::Precondition {
+                path,
+                source: reason.into(),
             },
             _ => Self::Generic {
                 store: "LocalFileSystem",
@@ -333,13 +343,6 @@ impl ObjectStore for LocalFileSystem {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        if matches!(opts.mode, PutMode::Update(_)) {
-            return Err(crate::Error::NotImplemented {
-                operation: "`put_opts` with mode `PutMode::Update`".into(),
-                implementer: self.to_string(),
-            });
-        }
-
         if !opts.attributes.is_empty() {
             return Err(crate::Error::NotImplemented {
                 operation: "`put_opts` with `opts.attributes` specified".into(),
@@ -382,7 +385,50 @@ impl ObjectStore for LocalFileSystem {
                                 _ => Some(Error::UnableToRenameFile { source }),
                             },
                         },
-                        PutMode::Update(_) => unreachable!(),
+                        PutMode::Update(update) => {
+                            // Compare-and-swap: replace the target only if its
+                            // current ETag matches the witness. Hold an
+                            // exclusive advisory lock on the parent directory
+                            // across the read-compare-rename so a concurrent
+                            // delete or conditional write cannot interleave
+                            // (see `lock_parent_dir_exclusive`).
+                            match lock_parent_dir_exclusive(&path) {
+                                Ok(_dir_lock) => match std::fs::metadata(&path) {
+                                    Ok(current) => {
+                                        if update.e_tag.as_deref()
+                                            == Some(get_etag(&current).as_str())
+                                        {
+                                            std::mem::drop(file);
+                                            match std::fs::rename(&staging_path, &path) {
+                                                Ok(_) => None,
+                                                Err(source) => {
+                                                    Some(Error::UnableToRenameFile { source })
+                                                }
+                                            }
+                                        } else {
+                                            Some(Error::Precondition {
+                                                path: path.to_string_lossy().to_string(),
+                                                reason: format!(
+                                                    "ETag {:?} does not match the current object",
+                                                    update.e_tag
+                                                ),
+                                            })
+                                        }
+                                    }
+                                    Err(source) if source.kind() == ErrorKind::NotFound => {
+                                        Some(Error::Precondition {
+                                            path: path.to_string_lossy().to_string(),
+                                            reason: "the object no longer exists".into(),
+                                        })
+                                    }
+                                    Err(source) => Some(Error::Metadata {
+                                        source: source.into(),
+                                        path: path.to_string_lossy().to_string(),
+                                    }),
+                                },
+                                Err(e) => Some(e),
+                            }
+                        }
                     }
                 }
                 Err(source) => Some(Error::UnableToCopyDataToFile { source }),
@@ -673,7 +719,19 @@ impl LocalFileSystem {
         location: &Path,
     ) -> Result<()> {
         let path = config.path_to_filesystem(location)?;
-        if let Err(e) = std::fs::remove_file(&path) {
+        // Serialise the unlink against a `PutMode::Update` compare-and-swap on
+        // the same object (see `lock_parent_dir_exclusive`) so a delete cannot
+        // land between the CAS's ETag read and its rename. Skip locking when the
+        // parent is already gone — the object cannot exist, so the removal below
+        // surfaces `NotFound` as before.
+        let removed = {
+            let _dir_lock = match path.parent() {
+                Some(parent) if parent.exists() => Some(lock_parent_dir_exclusive(&path)?),
+                _ => None,
+            };
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = removed {
             Err(match e.kind() {
                 ErrorKind::NotFound => Error::NotFound { path, source: e }.into(),
                 _ => Error::UnableToDeleteFile { path, source: e }.into(),
@@ -825,6 +883,41 @@ fn staged_upload_path(dest: &std::path::Path, suffix: &str) -> PathBuf {
     staging_path.push("#");
     staging_path.push(suffix);
     staging_path.into()
+}
+
+/// Acquire an exclusive advisory lock (`flock`) on the parent directory of
+/// `path`, held until the returned handle is dropped. This serialises a
+/// `PutMode::Update` compare-and-swap against a concurrent delete or
+/// conditional write, so a conditional overwrite cannot resurrect an object
+/// another writer removed between the CAS's ETag read and its rename.
+///
+/// The lock is on the parent directory rather than the file itself because a
+/// successful `rename` swaps the target's inode; a lock held on the file would
+/// not exclude a writer that renamed a fresh inode into place. `flock` is
+/// advisory and cross-process on a single host — sufficient because every
+/// mutation of these paths goes through this store — and auto-releases when the
+/// handle's file descriptor is closed, so a crashed writer leaves no stale lock.
+///
+/// Unix only (macOS / Linux); panics on other platforms.
+#[cfg(unix)]
+fn lock_parent_dir_exclusive(path: &std::path::Path) -> std::result::Result<File, Error> {
+    let dir = path.parent().unwrap_or(path);
+    let handle = File::open(dir).map_err(|source| Error::UnableToOpenFile {
+        source,
+        path: dir.to_path_buf(),
+    })?;
+    rustix::fs::flock(&handle, rustix::fs::FlockOperation::LockExclusive).map_err(|source| {
+        Error::UnableToLockDir {
+            source: std::io::Error::from(source),
+            path: dir.to_path_buf(),
+        }
+    })?;
+    Ok(handle)
+}
+
+#[cfg(not(unix))]
+fn lock_parent_dir_exclusive(_path: &std::path::Path) -> std::result::Result<File, Error> {
+    unimplemented!("LocalFileSystem conditional writes (PutMode::Update) require a unix platform")
 }
 
 #[derive(Debug)]
@@ -1279,7 +1372,7 @@ mod tests {
         copy_if_not_exists(&integration).await;
         copy_rename_nonexistent_object(&integration).await;
         stream_get(&integration).await;
-        put_opts(&integration, false).await;
+        put_opts(&integration, true).await;
     }
 
     #[test]
