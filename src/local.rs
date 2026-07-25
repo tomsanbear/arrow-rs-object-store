@@ -16,7 +16,7 @@
 // under the License.
 
 //! An object store implementation for a local filesystem
-use std::fs::{File, Metadata, OpenOptions, metadata, symlink_metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 #[cfg(target_family = "unix")]
@@ -796,7 +796,15 @@ impl LocalFileSystem {
                 Err(e) => return Some(Err(e)),
             };
 
-            if !entry.path().is_file() {
+            // walkdir's own file type, not `Path::is_file()`. They agree under
+            // `follow_links(true)` — walkdir reports the resolved target's type
+            // — but `Path::is_file()` is a fresh `fs::metadata` that returns
+            // FALSE for every error, not just "not a regular file". A transient
+            // stat failure would silently drop a present file from a listing
+            // that still reports success. This is also the idiom
+            // `list_with_delimiter` already uses (`entry.file_type().is_dir()`),
+            // and it saves a stat per entry.
+            if !entry.file_type().is_file() {
                 return None;
             }
 
@@ -1296,36 +1304,29 @@ fn get_inode(_metadata: &Metadata) -> u64 {
     0
 }
 
-/// Convert walkdir results and converts not-found errors into `None`.
-/// Convert broken symlinks to `None`.
+/// Convert walkdir results, mapping a not-found error to `None`.
+///
+/// Broken symlinks arrive here as a not-found ERROR, not as an `Ok` entry, so
+/// they take the same path: both listing walks set `follow_links(true)`, and
+/// walkdir then resolves every symlink itself (`handle_entry` calls `follow`,
+/// which is a `fs::metadata` of the link) before yielding it. A dangling target
+/// fails that resolution and is reported as an error against the LINK's path.
+///
+/// This used to re-do that resolution with its own `symlink_metadata` +
+/// `metadata` pair, and skip the entry when EITHER stat failed for ANY reason.
+/// Both stats were redundant — walkdir had already made the same syscall — and
+/// the `Err(_) => Ok(None)` arms silently dropped entries that a listing then
+/// reported as complete. A stat can fail on a file that is perfectly present:
+/// `ESTALE` on NFS, `EIO` on a faulty or network-backed mount, `EACCES` if an
+/// ancestor's permissions change mid-walk. Dropping those is worse than
+/// surfacing them, because a caller cannot tell a short listing from a
+/// complete one, and consumers that diff a listing against a reference set
+/// (garbage collectors, sync tools) read the absence as a deletion.
 fn convert_walkdir_result(
     res: std::result::Result<DirEntry, walkdir::Error>,
 ) -> Result<Option<DirEntry>> {
     match res {
-        Ok(entry) => {
-            // To check for broken symlink: call symlink_metadata() - it does not traverse symlinks);
-            // if ok: check if entry is symlink; and try to read it by calling metadata().
-            match symlink_metadata(entry.path()) {
-                Ok(attr) => {
-                    if attr.is_symlink() {
-                        let target_metadata = metadata(entry.path());
-                        match target_metadata {
-                            Ok(_) => {
-                                // symlink is valid
-                                Ok(Some(entry))
-                            }
-                            Err(_) => {
-                                // this is a broken symlink, return None
-                                Ok(None)
-                            }
-                        }
-                    } else {
-                        Ok(Some(entry))
-                    }
-                }
-                Err(_) => Ok(None),
-            }
-        }
+        Ok(entry) => Ok(Some(entry)),
 
         Err(walkdir_err) => match walkdir_err.io_error() {
             Some(io_err) => match io_err.kind() {
